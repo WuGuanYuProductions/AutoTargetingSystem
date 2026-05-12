@@ -18,8 +18,6 @@ public:
 
 protected:
     virtual void BeginPlay() override;
-
-    // 【Bug修复】：防止组件被销毁时没有归还控制权
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 public:
@@ -100,9 +98,10 @@ private:
 
     bool bIsTargeting;
     bool bIsCameraInputIgnored;
-
-    // 【迭代1】：用于标记当前是否处于镜头归位过渡期
     bool bIsResettingCamera;
+
+    // mark for if pausing dynamic targeting
+    bool bIsDynamicTargetingPaused;
 
     void FindAndSetBestTarget();
     TArray<AActor*> GetValidEnemiesOnScreen();
