@@ -15,15 +15,15 @@ class TSTPROJECTCPP_API ITargetableInterface
     GENERATED_BODY()
 
 public:
-    // 获取当前血量
+    // Get enemy current health
     UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Targeting")
     float GetCurrentHealth() const;
 
-    // --- 新增：被锁定时的事件 ---
+    // Event On Locked
     UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Targeting")
     void OnTargeted();
 
-    // --- 新增：取消锁定时的事件 ---
+    // Event On Unlocked
     UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Targeting")
     void OnUntargeted();
 };
