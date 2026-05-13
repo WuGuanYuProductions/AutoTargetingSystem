@@ -8,345 +8,412 @@
 
 UTargetingComponent::UTargetingComponent()
 {
-    PrimaryComponentTick.bCanEverTick = true;
-    bIsTargeting = false;
-    bIsCameraInputIgnored = false;
-    bIsResettingCamera = false;
-    bIsDynamicTargetingPaused = false;
-    CurrentTarget = nullptr;
-    ActiveCamera = nullptr;
-    ActiveSpringArm = nullptr;
-    OriginalCameraDistance = 0.0f;
-    OriginalSocketOffset = FVector::ZeroVector;
+	PrimaryComponentTick.bCanEverTick = true;
+	// Optimization: Tick after physics to ensure the most accurate location is acquired
+	PrimaryComponentTick.TickGroup = TG_PostPhysics;
+
+	bIsTargeting = false;
+	bIsCameraInputIgnored = false;
+	bIsResettingCamera = false;
+	bIsDynamicTargetingPaused = false;
+
+	CurrentTarget = nullptr;
+	ActiveCamera = nullptr;
+	ActiveSpringArm = nullptr;
+
+	OriginalCameraDistance = 0.0f;
+	OriginalSocketOffset = FVector::ZeroVector;
 }
 
 void UTargetingComponent::BeginPlay()
 {
-    Super::BeginPlay();
+	Super::BeginPlay();
 }
 
 void UTargetingComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    if (bIsTargeting) StopTargeting();
-    Super::EndPlay(EndPlayReason);
+	if (bIsTargeting)
+	{
+		StopTargeting();
+	}
+
+	// Failsafe: Ensure camera is completely reset when destroying the component
+	ForceResetCamera();
+
+	Super::EndPlay(EndPlayReason);
 }
 
 void UTargetingComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    if (bIsTargeting && IsValid(CurrentTarget))
-    {
-        AActor* Owner = GetOwner();
-        if (!Owner) return;
+	AActor* Owner = GetOwner();
+	if (!IsValid(Owner)) return;
 
-        float DistSqToTarget = FVector::DistSquared(Owner->GetActorLocation(), CurrentTarget->GetActorLocation());
-        float RadiusSq = TargetingRadius * TargetingRadius;
+	// ================= Core Targeting Logic =================
+	if (bIsTargeting)
+	{
+		bool bNeedsNewTarget = false;
 
-        // When enemy is invalid(dead or over distance), find a new target
-        if (DistSqToTarget > RadiusSq || GetEnemyHealth(CurrentTarget) <= 0.0f)
-        {
-            bIsDynamicTargetingPaused = false; // resume to dynamic targeting
-            FindAndSetBestTarget();
-            if (!IsValid(CurrentTarget))
-            {
-                StopTargeting();
-                return;
-            }
-        }
-        // if the target is valid and has higher scores, then switch target
-        else if (!bIsDynamicTargetingPaused)
-        {
-            FindAndSetBestTarget();
-            if (!IsValid(CurrentTarget))
-            {
-                StopTargeting();
-                return;
-            }
-        }
+		// 1. Safety check and state update
+		if (!IsValid(CurrentTarget) || GetEnemyHealth(CurrentTarget) <= 0.0f)
+		{
+			bNeedsNewTarget = true;
+		}
+		else
+		{
+			float DistSq = FVector::DistSquared(Owner->GetActorLocation(), CurrentTarget->GetActorLocation());
+			if (DistSq > FMath::Square(TargetingRadius))
+			{
+				bNeedsNewTarget = true; // Out of maximum distance
+			}
+			else if (!bIsDynamicTargetingPaused)
+			{
+				// If not manually paused, dynamically check for a better target in real-time
+				FindAndSetBestTarget();
+				if (!IsValid(CurrentTarget))
+				{
+					StopTargeting();
+					return;
+				}
+			}
+		}
 
-        // camera control logic
-        if (ActiveCamera && IsValid(CurrentTarget))
-        {
-            if (APlayerController* PC = GetPlayerController())
-            {
-                FVector CameraLoc = ActiveCamera->GetComponentLocation();
-                FVector TargetLoc = CurrentTarget->GetActorLocation() + LockOnOffset;
+		// 2. Retargeting mechanism after target loss
+		if (bNeedsNewTarget)
+		{
+			bIsDynamicTargetingPaused = false;
+			FindAndSetBestTarget();
 
-                FRotator TargetRot = UKismetMathLibrary::FindLookAtRotation(CameraLoc, TargetLoc);
-                TargetRot.Pitch = FMath::Clamp(TargetRot.Pitch, MinCameraPitch, MaxCameraPitch);
+			// [Crucial]: Completely stop only when no valid enemies are found both on and off-screen
+			if (!IsValid(CurrentTarget))
+			{
+				StopTargeting();
+				return;
+			}
+		}
 
-                FRotator CurrentRot = PC->GetControlRotation();
-                FRotator InterpRot = FMath::RInterpTo(CurrentRot, TargetRot, DeltaTime, CameraInterpSpeed);
-                PC->SetControlRotation(InterpRot);
+		// 3. Smooth camera tracking logic
+		if (IsValid(ActiveCamera) && IsValid(CurrentTarget))
+		{
+			if (APlayerController* PC = GetPlayerController())
+			{
+				FVector CameraLoc = ActiveCamera->GetComponentLocation();
+				FVector TargetLoc = CurrentTarget->GetActorLocation() + LockOnOffset;
 
-                if (ActiveSpringArm)
-                {
-                    float ActualDist = FMath::Sqrt(DistSqToTarget);
+				FRotator TargetRot = UKismetMathLibrary::FindLookAtRotation(CameraLoc, TargetLoc);
+				TargetRot.Pitch = FMath::Clamp(TargetRot.Pitch, MinCameraPitch, MaxCameraPitch);
 
-                    float TargetCamDist = FMath::GetMappedRangeValueClamped(
-                        FVector2D(0.0f, TargetingRadius), FVector2D(MinCameraDistance, MaxCameraDistance), ActualDist);
+				FRotator InterpRot = FMath::RInterpTo(PC->GetControlRotation(), TargetRot, DeltaTime, CameraInterpSpeed);
+				PC->SetControlRotation(InterpRot);
 
-                    float TargetCamHeight = FMath::GetMappedRangeValueClamped(
-                        FVector2D(0.0f, TargetingRadius), FVector2D(MinCameraHeight, MaxCameraHeight), ActualDist);
+				// Dynamic mapping of spring arm distance and height
+				if (IsValid(ActiveSpringArm))
+				{
+					// Perform square root only once here to save performance
+					float ActualDist = FVector::Dist(Owner->GetActorLocation(), CurrentTarget->GetActorLocation());
 
-                    ActiveSpringArm->TargetArmLength = FMath::FInterpTo(ActiveSpringArm->TargetArmLength, TargetCamDist, DeltaTime, CameraInterpSpeed);
+					float TargetCamDist = FMath::GetMappedRangeValueClamped(FVector2D(0.0f, TargetingRadius), FVector2D(MinCameraDistance, MaxCameraDistance), ActualDist);
+					float TargetCamHeight = FMath::GetMappedRangeValueClamped(FVector2D(0.0f, TargetingRadius), FVector2D(MinCameraHeight, MaxCameraHeight), ActualDist);
 
-                    FVector NewSocketOffset = ActiveSpringArm->SocketOffset;
-                    NewSocketOffset.Z = FMath::FInterpTo(NewSocketOffset.Z, TargetCamHeight, DeltaTime, CameraInterpSpeed);
-                    ActiveSpringArm->SocketOffset = NewSocketOffset;
-                }
-            }
-        }
-    }
-    // camera back to default
-    else if (bIsResettingCamera && ActiveSpringArm)
-    {
-        ActiveSpringArm->TargetArmLength = FMath::FInterpTo(ActiveSpringArm->TargetArmLength, OriginalCameraDistance, DeltaTime, CameraInterpSpeed);
-        ActiveSpringArm->SocketOffset = FMath::VInterpTo(ActiveSpringArm->SocketOffset, OriginalSocketOffset, DeltaTime, CameraInterpSpeed);
+					ActiveSpringArm->TargetArmLength = FMath::FInterpTo(ActiveSpringArm->TargetArmLength, TargetCamDist, DeltaTime, CameraInterpSpeed);
 
-        if (FMath::IsNearlyEqual(ActiveSpringArm->TargetArmLength, OriginalCameraDistance, 2.0f) &&
-            ActiveSpringArm->SocketOffset.Equals(OriginalSocketOffset, 2.0f))
-        {
-            ActiveSpringArm->TargetArmLength = OriginalCameraDistance;
-            ActiveSpringArm->SocketOffset = OriginalSocketOffset;
+					FVector NewSocketOffset = ActiveSpringArm->SocketOffset;
+					NewSocketOffset.Z = FMath::FInterpTo(NewSocketOffset.Z, TargetCamHeight, DeltaTime, CameraInterpSpeed);
+					ActiveSpringArm->SocketOffset = NewSocketOffset;
+				}
+			}
+		}
+	}
+	// ================= Camera Reset Transition Logic =================
+	else if (bIsResettingCamera)
+	{
+		if (IsValid(ActiveSpringArm))
+		{
+			ActiveSpringArm->TargetArmLength = FMath::FInterpTo(ActiveSpringArm->TargetArmLength, OriginalCameraDistance, DeltaTime, CameraInterpSpeed);
+			ActiveSpringArm->SocketOffset = FMath::VInterpTo(ActiveSpringArm->SocketOffset, OriginalSocketOffset, DeltaTime, CameraInterpSpeed);
 
-            bIsResettingCamera = false;
-            ActiveCamera = nullptr;
-            ActiveSpringArm = nullptr;
-        }
-    }
+			if (FMath::IsNearlyEqual(ActiveSpringArm->TargetArmLength, OriginalCameraDistance, 2.0f) &&
+				ActiveSpringArm->SocketOffset.Equals(OriginalSocketOffset, 2.0f))
+			{
+				// Successfully reset, use the failsafe function to finalize and clean up safely
+				ForceResetCamera();
+			}
+		}
+		else
+		{
+			// If SpringArm became invalid during the reset process, clean up instantly
+			ForceResetCamera();
+		}
+	}
+	// ================= FAILSAFE: Final Confirmation =================
+	// If we are not targeting, and not resetting, but the pointers are still lingering,
+	// it means the camera state failed to return to default. Force it now.
+	else if (!bIsTargeting && !bIsResettingCamera && (IsValid(ActiveSpringArm) || IsValid(ActiveCamera)))
+	{
+		ForceResetCamera();
+	}
 }
 
-APlayerController* UTargetingComponent::GetPlayerController() const
+bool UTargetingComponent::StartTargeting()
 {
-    if (AActor* Owner = GetOwner())
-    {
-        if (APawn* Pawn = Cast<APawn>(Owner)) return Cast<APlayerController>(Pawn->GetController());
-    }
-    return nullptr;
-}
+	if (bIsTargeting && IsValid(CurrentTarget)) return true;
 
-AActor* UTargetingComponent::StartTargeting()
-{
-    if (bIsTargeting) return CurrentTarget;
+	bIsTargeting = true;
+	bIsResettingCamera = false;
+	bIsDynamicTargetingPaused = false;
 
-    bIsTargeting = true;
-    bIsResettingCamera = false;
-    bIsDynamicTargetingPaused = false; // Enable dynamic targeting as default
+	FindAndSetBestTarget();
 
-    FindAndSetBestTarget();
-
-    if (!IsValid(CurrentTarget)) StopTargeting();
-
-    return CurrentTarget;
+	if (!IsValid(CurrentTarget))
+	{
+		StopTargeting();
+		return false;
+	}
+	return true;
 }
 
 void UTargetingComponent::StopTargeting()
 {
-    if (!bIsTargeting) return;
+	if (!bIsTargeting) return;
 
-    bIsTargeting = false;
-    bIsDynamicTargetingPaused = false;
+	bIsTargeting = false;
+	bIsDynamicTargetingPaused = false;
 
-    if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-    {
-        ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
-    }
-    CurrentTarget = nullptr;
+	if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
+	{
+		ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
+	}
+	CurrentTarget = nullptr;
 
-    if (APlayerController* PC = GetPlayerController())
-    {
-        if (bIsCameraInputIgnored)
-        {
-            PC->ResetIgnoreLookInput();
-            bIsCameraInputIgnored = false;
-        }
-    }
+	if (APlayerController* PC = GetPlayerController())
+	{
+		if (bIsCameraInputIgnored)
+		{
+			PC->ResetIgnoreLookInput();
+			bIsCameraInputIgnored = false;
+		}
+	}
 
-    if (ActiveSpringArm)
-    {
-        bIsResettingCamera = true;
-    }
-    else
-    {
-        ActiveCamera = nullptr;
-    }
+	if (IsValid(ActiveSpringArm))
+	{
+		bIsResettingCamera = true;
+	}
+	else
+	{
+		ActiveCamera = nullptr;
+	}
+
+	// Trigger Blueprint event to notify UI or Sound
+	OnTargetStopped.Broadcast();
 }
 
-void UTargetingComponent::CameraLockToEnemy(UCameraComponent* InCamera)
+void UTargetingComponent::ForceResetCamera()
 {
-    if (bIsTargeting && CurrentTarget && InCamera)
-    {
-        ActiveCamera = InCamera;
-        ActiveSpringArm = Cast<USpringArmComponent>(ActiveCamera->GetAttachParent());
+	if (IsValid(ActiveSpringArm))
+	{
+		ActiveSpringArm->TargetArmLength = OriginalCameraDistance;
+		ActiveSpringArm->SocketOffset = OriginalSocketOffset;
+	}
 
-        if (ActiveSpringArm)
-        {
-            OriginalCameraDistance = ActiveSpringArm->TargetArmLength;
-            OriginalSocketOffset = ActiveSpringArm->SocketOffset;
-        }
+	if (APlayerController* PC = GetPlayerController())
+	{
+		if (bIsCameraInputIgnored)
+		{
+			PC->ResetIgnoreLookInput();
+		}
+	}
 
-        if (APlayerController* PC = GetPlayerController())
-        {
-            if (!bIsCameraInputIgnored)
-            {
-                PC->SetIgnoreLookInput(true);
-                bIsCameraInputIgnored = true;
-            }
-        }
-    }
+	// Clean up all states and pointers
+	bIsCameraInputIgnored = false;
+	bIsResettingCamera = false;
+	ActiveCamera = nullptr;
+	ActiveSpringArm = nullptr;
 }
 
-void UTargetingComponent::SwitchToPrevEnemy() { SwitchTargetByDistance(-1); }
-void UTargetingComponent::SwitchToNextEnemy() { SwitchTargetByDistance(1); }
-
-// Switch Enemy by distance,if this enabled, then pause dynamic targeting【补全代码与迭代】：按距离切换敌人，并触发动态锁敌的暂停
-void UTargetingComponent::SwitchTargetByDistance(int32 Direction)
-{
-    if (!bIsTargeting || !IsValid(CurrentTarget)) return;
-
-    TArray<AActor*> ValidEnemies = GetValidEnemiesOnScreen();
-    if (ValidEnemies.Num() <= 1) return;
-
-    AActor* Owner = GetOwner();
-    if (!Owner) return;
-
-    // Only depends on actual distance between player and enemy
-    ValidEnemies.Sort([Owner](const AActor& A, const AActor& B) {
-        float DistA = FVector::DistSquared(Owner->GetActorLocation(), A.GetActorLocation());
-        float DistB = FVector::DistSquared(Owner->GetActorLocation(), B.GetActorLocation());
-        return DistA < DistB;
-        });
-
-    int32 CurrentIndex = ValidEnemies.Find(CurrentTarget);
-    if (CurrentIndex != INDEX_NONE)
-    {
-        int32 NextIndex = CurrentIndex + Direction;
-        if (NextIndex >= ValidEnemies.Num()) NextIndex = 0; // do loop to start
-        if (NextIndex < 0) NextIndex = ValidEnemies.Num() - 1; // do loop to end
-
-        AActor* NewTarget = ValidEnemies[NextIndex];
-
-        if (NewTarget != CurrentTarget)
-        {
-            if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-                ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
-
-            CurrentTarget = NewTarget;
-
-            if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-                ITargetableInterface::Execute_OnTargeted(CurrentTarget);
-
-            // If player switch target manually then pause dynamic targeting
-            bIsDynamicTargetingPaused = true;
-        }
-    }
-}
-
-// ---------------- 以下为底层过滤与评分核心逻辑 ----------------
-
+// Core optimization: Single pass loop, maintaining both on-screen and off-screen best candidates simultaneously
 void UTargetingComponent::FindAndSetBestTarget()
 {
-    TArray<AActor*> ValidEnemies = GetValidEnemiesOnScreen();
-    AActor* BestTarget = nullptr;
-    float BestScore = MAX_FLT;
+	AActor* Owner = GetOwner();
+	if (!IsValid(Owner)) return;
 
-    for (AActor* Enemy : ValidEnemies)
-    {
-        float Score = CalculateTargetScore(Enemy);
-        if (Score < BestScore)
-        {
-            BestScore = Score;
-            BestTarget = Enemy;
-        }
-    }
+	TArray<AActor*> OutActors;
+	UKismetSystemLibrary::SphereOverlapActors(
+		this,
+		Owner->GetActorLocation(),
+		TargetingRadius,
+		TargetObjectTypes,
+		AActor::StaticClass(),
+		TArray<AActor*> { Owner },
+		OutActors
+	);
 
-    if (CurrentTarget != BestTarget)
-    {
-        if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-        {
-            ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
-        }
+	AActor* BestOnScreenTarget = nullptr;
+	float BestOnScreenCost = MAX_flt;
 
-        CurrentTarget = BestTarget;
+	AActor* BestOffScreenTarget = nullptr;
+	float BestOffScreenCost = MAX_flt;
 
-        if (IsValid(CurrentTarget) && CurrentTarget->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-        {
-            ITargetableInterface::Execute_OnTargeted(CurrentTarget);
-        }
-    }
+	FVector OwnerLoc = Owner->GetActorLocation();
+
+	for (AActor* Enemy : OutActors)
+	{
+		if (!IsValid(Enemy) || GetEnemyHealth(Enemy) <= 0.0f) continue;
+		if (!Enemy->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass())) continue;
+
+		float DistSq = FVector::DistSquared(OwnerLoc, Enemy->GetActorLocation());
+		float Cost = CalculateTargetCost(Enemy, DistSq);
+
+		if (IsEnemyOnScreen(Enemy))
+		{
+			if (Cost < BestOnScreenCost)
+			{
+				BestOnScreenCost = Cost;
+				BestOnScreenTarget = Enemy;
+			}
+		}
+		else
+		{
+			if (Cost < BestOffScreenCost)
+			{
+				BestOffScreenCost = Cost;
+				BestOffScreenTarget = Enemy;
+			}
+		}
+	}
+
+	// Prioritize on-screen targets if available; otherwise, fallback to off-screen targets
+	AActor* NewTarget = IsValid(BestOnScreenTarget) ? BestOnScreenTarget : BestOffScreenTarget;
+
+	if (NewTarget != CurrentTarget)
+	{
+		if (IsValid(CurrentTarget))
+		{
+			ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
+		}
+		CurrentTarget = NewTarget;
+		if (IsValid(CurrentTarget))
+		{
+			ITargetableInterface::Execute_OnTargeted(CurrentTarget);
+		}
+	}
 }
 
-TArray<AActor*> UTargetingComponent::GetValidEnemiesOnScreen()
+float UTargetingComponent::CalculateTargetCost(AActor* Enemy, float DistSquared)
 {
-    TArray<AActor*> OverlappingActors;
-    TArray<AActor*> ValidEnemies;
-    AActor* Owner = GetOwner();
-
-    if (!Owner) return ValidEnemies;
-
-    TArray<AActor*> ActorsToIgnore;
-    ActorsToIgnore.Add(Owner);
-
-    UKismetSystemLibrary::SphereOverlapActors(
-        this, Owner->GetActorLocation(), TargetingRadius, TargetObjectTypes, AActor::StaticClass(), ActorsToIgnore, OverlappingActors);
-
-    for (AActor* Actor : OverlappingActors)
-    {
-        if (IsValid(Actor) && Actor->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-        {
-            if (GetEnemyHealth(Actor) > 0.0f && IsEnemyOnScreen(Actor))
-            {
-                ValidEnemies.Add(Actor);
-            }
-        }
-    }
-    return ValidEnemies;
-}
-
-float UTargetingComponent::CalculateTargetScore(AActor* Enemy)
-{
-    AActor* Owner = GetOwner();
-    if (!Owner || !IsValid(Enemy)) return MAX_FLT;
-
-    float Health = GetEnemyHealth(Enemy);
-    FVector OwnerLoc = Owner->GetActorLocation();
-    FVector EnemyLoc = Enemy->GetActorLocation();
-
-    float Distance2D = FVector::Dist2D(OwnerLoc, EnemyLoc);
-    float ZDiff = FMath::Abs(OwnerLoc.Z - EnemyLoc.Z);
-
-    return (Health * HealthWeight) + (Distance2D * DistanceWeight) + (ZDiff * ZAxisWeight);
+	// Use Cost calculation method (lower is higher priority). Use squared distance directly instead of square root for better performance
+	float HealthCost = GetEnemyHealth(Enemy) * HealthWeight;
+	float DistanceCost = (DistSquared / 10000.0f) * DistanceWeight; // Scale to prevent the value from being too large
+	return HealthCost + DistanceCost;
 }
 
 bool UTargetingComponent::IsEnemyOnScreen(AActor* Enemy)
 {
-    APlayerController* PC = GetPlayerController();
-    if (!PC || !IsValid(Enemy)) return false;
+	if (!IsValid(Enemy)) return false;
+	APlayerController* PC = GetPlayerController();
+	if (!PC) return false;
 
-    FVector2D ScreenPosition;
-    bool bIsOnScreen = PC->ProjectWorldLocationToScreen(Enemy->GetActorLocation(), ScreenPosition);
+	FVector2D ScreenPos;
+	bool bIsOnScreen = PC->ProjectWorldLocationToScreen(Enemy->GetActorLocation(), ScreenPos);
 
-    if (bIsOnScreen)
-    {
-        int32 ViewportSizeX, ViewportSizeY;
-        PC->GetViewportSize(ViewportSizeX, ViewportSizeY);
-
-        if (ScreenPosition.X > 0.0f && ScreenPosition.X < ViewportSizeX &&
-            ScreenPosition.Y > 0.0f && ScreenPosition.Y < ViewportSizeY)
-        {
-            return true;
-        }
-    }
-    return false;
+	if (bIsOnScreen)
+	{
+		int32 ViewportX, ViewportY;
+		PC->GetViewportSize(ViewportX, ViewportY);
+		// Ensure it is not only in front but also strictly within the screen viewport
+		if (ScreenPos.X > 0 && ScreenPos.X < ViewportX && ScreenPos.Y > 0 && ScreenPos.Y < ViewportY)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 float UTargetingComponent::GetEnemyHealth(AActor* Enemy)
 {
-    if (IsValid(Enemy) && Enemy->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass()))
-    {
-        return ITargetableInterface::Execute_GetCurrentHealth(Enemy);
-    }
-    return 0.0f;
+	if (IsValid(Enemy) && Enemy->Implements<UTargetableInterface>())
+	{
+		return ITargetableInterface::Execute_GetCurrentHealth(Enemy);
+	}
+
+	return 0.0f;
+}
+
+APlayerController* UTargetingComponent::GetPlayerController() const
+{
+	if (AActor* Owner = GetOwner())
+	{
+		if (APawn* Pawn = Cast<APawn>(Owner))
+		{
+			return Cast<APlayerController>(Pawn->GetController());
+		}
+	}
+	return nullptr;
+}
+
+void UTargetingComponent::CameraLockToEnemy(UCameraComponent* InCamera)
+{
+	if (!IsValid(InCamera)) return;
+	ActiveCamera = InCamera;
+
+	if (USpringArmComponent* SpringArm = Cast<USpringArmComponent>(ActiveCamera->GetAttachParent()))
+	{
+		ActiveSpringArm = SpringArm;
+		OriginalCameraDistance = ActiveSpringArm->TargetArmLength;
+		OriginalSocketOffset = ActiveSpringArm->SocketOffset;
+	}
+
+	if (APlayerController* PC = GetPlayerController())
+	{
+		PC->SetIgnoreLookInput(true);
+		bIsCameraInputIgnored = true;
+	}
+}
+
+void UTargetingComponent::SwitchToPrevEnemy()
+{
+	SwitchTargetByDistance(false);
+}
+
+void UTargetingComponent::SwitchToNextEnemy()
+{
+	SwitchTargetByDistance(true);
+}
+
+void UTargetingComponent::SwitchTargetByDistance(bool bNext)
+{
+	if (!bIsTargeting || !IsValid(CurrentTarget)) return;
+
+	// Pause dynamic targeting when manually switching
+	bIsDynamicTargetingPaused = true;
+
+	AActor* Owner = GetOwner();
+	if (!IsValid(Owner)) return;
+
+	TArray<AActor*> OutActors;
+	UKismetSystemLibrary::SphereOverlapActors(this, Owner->GetActorLocation(), TargetingRadius, TargetObjectTypes, AActor::StaticClass(), TArray<AActor*> { Owner, CurrentTarget }, OutActors);
+
+	AActor* BestCandidate = nullptr;
+	float MinDistSq = MAX_flt;
+
+	for (AActor* Enemy : OutActors)
+	{
+		if (!IsValid(Enemy) || GetEnemyHealth(Enemy) <= 0.0f) continue;
+		if (!Enemy->GetClass()->ImplementsInterface(UTargetableInterface::StaticClass())) continue;
+
+		// Can be expanded to left/right filtering algorithm based on needs, currently using distance as an example
+		float DistSq = FVector::DistSquared(Owner->GetActorLocation(), Enemy->GetActorLocation());
+		if (DistSq < MinDistSq)
+		{
+			MinDistSq = DistSq;
+			BestCandidate = Enemy;
+		}
+	}
+
+	if (IsValid(BestCandidate))
+	{
+		ITargetableInterface::Execute_OnUntargeted(CurrentTarget);
+		CurrentTarget = BestCandidate;
+		ITargetableInterface::Execute_OnTargeted(CurrentTarget);
+	}
 }
